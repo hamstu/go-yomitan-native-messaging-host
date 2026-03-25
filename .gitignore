@@ -1,0 +1,29 @@
+# Binaries
+yomitan-host
+yomitan-host-*
+*.exe
+builds/
+
+# Error logs
+error.log
+
+# PID file
+.crowbar
+
+# Go build files
+*.test
+*.out
+
+# Claude Code
+.claude/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
