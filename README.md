@@ -2,6 +2,8 @@
 
 A Go implementation of the native messaging host for [Yomitan API](https://github.com/yomidevs/yomitan-api). It acts as a bridge between the Yomitan browser extension and local system resources, communicating over the browser's native messaging protocol (stdin/stdout) and exposing a local HTTP server on `127.0.0.1:19633`.
 
+It is a Go port of upstream's `yomitan_api.py`, and it's used by [Kimochi](https://github.com/hamstu/kimochi-tauri).
+
 ## Building
 
 ```bash
@@ -35,3 +37,7 @@ The host is started automatically by the browser when the Yomitan extension need
 ```bash
 go test ./...
 ```
+
+## Licence
+
+GPL-3.0, the same as upstream [yomitan-api](https://github.com/yomidevs/yomitan-api). See [LICENSE](LICENSE).
