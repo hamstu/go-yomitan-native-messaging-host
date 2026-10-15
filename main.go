@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -105,8 +105,9 @@ type NativeMessage struct {
 }
 
 type YomitanResponse struct {
-	ResponseStatusCode int         `json:"responseStatusCode"`
-	Data               any         `json:"data"`
+	ResponseStatusCode int                 `json:"responseStatusCode"`
+	Data               any                 `json:"data"`
+	Params             map[string][]string `json:"params,omitempty"`
 }
 
 // readMessage reads a native messaging message from the given reader.
@@ -158,20 +159,145 @@ func writeMessage(w io.Writer, message interface{}) error {
 	return nil
 }
 
-// getMessage reads from stdin (used in main loop).
-func getMessage() (*YomitanResponse, error) {
-	return readMessage(bufio.NewReader(os.Stdin))
+// requestIDParam is added to every forwarded request's params. Yomitan echoes a request's params
+// in its reply, so the id routes each reply to its caller even when replies arrive out of order.
+const requestIDParam = "_requestId"
+
+const responseTimeout = 30 * time.Second
+
+type pendingRequest struct {
+	id    string
+	reply chan YomitanResponse
 }
 
-// sendMessage writes to stdout (used in main loop).
-func sendMessage(message interface{}) error {
-	return writeMessage(os.Stdout, message)
+// bridge multiplexes HTTP requests over the one native-messaging port.
+//
+// Yomitan handles each message as it arrives and replies when that message's work finishes, so a
+// slow request (an ankiFields call that downloads audio can take seconds) must not hold up a fast
+// one (a tokenize takes milliseconds). Requests are written as they come and replies are matched
+// by the echoed request id.
+//
+// A Yomitan that does not echo params would make out-of-order replies unroutable, so until a reply
+// has carried an id back the bridge keeps one request in flight and matches replies in order.
+type bridge struct {
+	writeMu sync.Mutex
+	w       io.Writer
+
+	serial  sync.Mutex // held for a whole round trip until echoing is confirmed
+	echoes  atomic.Bool
+	mu      sync.Mutex
+	nextID  uint64
+	pending []pendingRequest
+}
+
+func newBridge(w io.Writer) *bridge {
+	return &bridge{w: w}
+}
+
+// roundTrip forwards one request to Yomitan and waits for its reply.
+func (b *bridge) roundTrip(message NativeMessage, timeout time.Duration) (YomitanResponse, error) {
+	if !b.echoes.Load() {
+		b.serial.Lock()
+		defer b.serial.Unlock()
+	}
+
+	b.mu.Lock()
+	b.nextID++
+	id := strconv.FormatUint(b.nextID, 10)
+	reply := make(chan YomitanResponse, 1)
+	b.pending = append(b.pending, pendingRequest{id: id, reply: reply})
+	b.mu.Unlock()
+
+	params := make(map[string][]string, len(message.Params)+1)
+	for key, values := range message.Params {
+		params[key] = values
+	}
+	params[requestIDParam] = []string{id}
+	message.Params = params
+
+	b.writeMu.Lock()
+	err := writeMessage(b.w, message)
+	b.writeMu.Unlock()
+	if err != nil {
+		b.forget(id)
+		return YomitanResponse{}, err
+	}
+
+	select {
+	case response := <-reply:
+		return response, nil
+	case <-time.After(timeout):
+		b.forget(id)
+		return YomitanResponse{}, errTimeout
+	}
+}
+
+var errTimeout = fmt.Errorf("timed out waiting for Yomitan")
+
+// forget drops a request that will not wait for its reply. Without echoed ids a late reply is
+// matched by position, so the slot stays and absorbs that reply instead of misrouting it.
+func (b *bridge) forget(id string) {
+	if !b.echoes.Load() {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, p := range b.pending {
+		if p.id == id {
+			b.pending = append(b.pending[:i], b.pending[i+1:]...)
+			return
+		}
+	}
+}
+
+// deliver routes one reply from Yomitan to the request it answers.
+func (b *bridge) deliver(response YomitanResponse) {
+	var id string
+	if ids := response.Params[requestIDParam]; len(ids) > 0 {
+		id = ids[0]
+		b.echoes.Store(true)
+	}
+	response.Params = nil
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	index := -1
+	if id != "" {
+		for i, p := range b.pending {
+			if p.id == id {
+				index = i
+				break
+			}
+		}
+	} else if len(b.pending) > 0 {
+		index = 0
+	}
+	if index < 0 {
+		return // its caller gave up
+	}
+	p := b.pending[index]
+	b.pending = append(b.pending[:index], b.pending[index+1:]...)
+	p.reply <- response
+}
+
+// run reads replies until the browser closes the port.
+func (b *bridge) run(r io.Reader) error {
+	reader := bufio.NewReader(r)
+	for {
+		response, err := readMessage(reader)
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return nil
+		}
+		b.deliver(*response)
+	}
 }
 
 // HTTP request handler
 type requestHandler struct {
-	messageChan chan<- NativeMessage
-	responseChan <-chan YomitanResponse
+	bridge *bridge
 }
 
 func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -232,35 +358,30 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		paramsMap[key] = values
 	}
 
-	// Send message to native messaging channel
 	message := NativeMessage{
 		Action: path,
 		Params: paramsMap,
 		Body:   string(bodyBytes),
 	}
 
-	select {
-	case h.messageChan <- message:
-		// Message sent successfully
-	case <-time.After(5 * time.Second):
+	response, err := h.bridge.roundTrip(message, responseTimeout)
+	if err == errTimeout {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		return
+	}
+	if err != nil {
+		errorLog("Failed to send message", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
-	// Wait for response from Yomitan
-	select {
-	case response := <-h.responseChan:
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(response.ResponseStatusCode)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.ResponseStatusCode)
 
-		// Marshal response data with ensure_ascii=false equivalent (UTF-8)
-		encoder := json.NewEncoder(w)
-		encoder.SetEscapeHTML(false)
-		encoder.Encode(response.Data)
-
-	case <-time.After(30 * time.Second):
-		w.WriteHeader(http.StatusGatewayTimeout)
-	}
+	// Marshal response data with ensure_ascii=false equivalent (UTF-8)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	encoder.Encode(response.Data)
 }
 
 func main() {
@@ -278,19 +399,10 @@ func main() {
 	ensureSingleInstance()
 	defer deleteCrowbarFile()
 
-	// Create channels for communication between HTTP server and native messaging
-	messageChan := make(chan NativeMessage, 1)
-	responseChan := make(chan YomitanResponse, 1)
-
-	// Start HTTP server
-	handler := &requestHandler{
-		messageChan:  messageChan,
-		responseChan: responseChan,
-	}
-
+	b := newBridge(os.Stdout)
 	server := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", ADDR, PORT),
-		Handler: handler,
+		Handler: &requestHandler{bridge: b},
 	}
 
 	// Start HTTP server in goroutine
@@ -301,44 +413,14 @@ func main() {
 		}
 	}()
 
-	// Main loop for native messaging
+	// Replies from the browser extension; the port closing ends the host.
 	go func() {
-		for {
-			select {
-			case message := <-messageChan:
-				// Send message to browser extension
-				if err := sendMessage(message); err != nil {
-					errorLog("Failed to send message", err)
-					continue
-				}
-
-				// Read response from browser extension
-				response, err := getMessage()
-				if err != nil {
-					errorLog("Failed to get message", err)
-					// Send error response
-					responseChan <- YomitanResponse{
-						ResponseStatusCode: 500,
-						Data:              map[string]string{"error": "Failed to communicate with extension"},
-					}
-					continue
-				}
-
-				if response == nil {
-					// EOF or clean exit
-					os.Exit(0)
-				}
-
-				// Send response back to HTTP handler
-				responseChan <- *response
-
-			case <-sigChan:
-				log.Println("Received shutdown signal")
-				server.Close()
-				deleteCrowbarFile()
-				os.Exit(0)
-			}
+		if err := b.run(os.Stdin); err != nil {
+			errorLog("Failed to get message", err)
 		}
+		server.Close()
+		deleteCrowbarFile()
+		os.Exit(0)
 	}()
 
 	// Wait for signal

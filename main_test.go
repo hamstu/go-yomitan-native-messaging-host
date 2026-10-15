@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -165,15 +169,60 @@ func TestMultipleMessages(t *testing.T) {
 
 // --- HTTP handler tests ---
 
-func newTestHandler() (*requestHandler, chan NativeMessage, chan YomitanResponse) {
-	msgCh := make(chan NativeMessage, 1)
-	respCh := make(chan YomitanResponse, 1)
-	h := &requestHandler{messageChan: msgCh, responseChan: respCh}
-	return h, msgCh, respCh
+// fakeExtension stands in for Yomitan on the other end of the native-messaging port. Each
+// message it receives is passed to answer on its own goroutine, as Yomitan handles each message
+// independently; answer returns the reply to send, or nil to send none.
+func newTestHandler(t *testing.T, answer func(NativeMessage) *YomitanResponse) *requestHandler {
+	t.Helper()
+	toExt, hostOut := io.Pipe()
+	hostIn, fromExt := io.Pipe()
+	b := newBridge(hostOut)
+	go b.run(hostIn)
+
+	var writeMu sync.Mutex
+	go func() {
+		reader := bufio.NewReader(toExt)
+		for {
+			lengthBytes := make([]byte, 4)
+			if _, err := io.ReadFull(reader, lengthBytes); err != nil {
+				return
+			}
+			payload := make([]byte, binary.NativeEndian.Uint32(lengthBytes))
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				return
+			}
+			var msg NativeMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				t.Errorf("extension got invalid JSON: %v", err)
+				return
+			}
+			go func() {
+				reply := answer(msg)
+				if reply == nil {
+					return
+				}
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				writeMessage(fromExt, reply)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		toExt.Close()
+		fromExt.Close()
+	})
+	return &requestHandler{bridge: b}
 }
 
+// echo answers like Yomitan does: with the request's params alongside the data.
+func echo(msg NativeMessage, status int, data any) *YomitanResponse {
+	return &YomitanResponse{ResponseStatusCode: status, Data: data, Params: msg.Params}
+}
+
+func noAnswer(NativeMessage) *YomitanResponse { return nil }
+
 func TestServerVersionEndpoint(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h := newTestHandler(t, noAnswer)
 
 	for _, path := range []string{"/serverVersion", "/"} {
 		req := httptest.NewRequest("POST", path, nil)
@@ -197,7 +246,7 @@ func TestServerVersionEndpoint(t *testing.T) {
 }
 
 func TestCORSHeaders(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h := newTestHandler(t, noAnswer)
 
 	req := httptest.NewRequest("POST", "/serverVersion", nil)
 	w := httptest.NewRecorder()
@@ -216,7 +265,7 @@ func TestCORSHeaders(t *testing.T) {
 }
 
 func TestOptionsRequest(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h := newTestHandler(t, noAnswer)
 
 	req := httptest.NewRequest("OPTIONS", "/anything", nil)
 	w := httptest.NewRecorder()
@@ -228,7 +277,7 @@ func TestOptionsRequest(t *testing.T) {
 }
 
 func TestGetRequestRejected(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h := newTestHandler(t, noAnswer)
 
 	req := httptest.NewRequest("GET", "/serverVersion", nil)
 	w := httptest.NewRecorder()
@@ -240,7 +289,7 @@ func TestGetRequestRejected(t *testing.T) {
 }
 
 func TestBlacklistedPath(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h := newTestHandler(t, noAnswer)
 
 	req := httptest.NewRequest("POST", "/favicon.ico", nil)
 	w := httptest.NewRecorder()
@@ -252,11 +301,7 @@ func TestBlacklistedPath(t *testing.T) {
 }
 
 func TestCustomActionForwarding(t *testing.T) {
-	h, msgCh, respCh := newTestHandler()
-
-	// Pre-load a response so the handler doesn't block
-	go func() {
-		msg := <-msgCh
+	h := newTestHandler(t, func(msg NativeMessage) *YomitanResponse {
 		if msg.Action != "customAction" {
 			t.Errorf("action = %q, want 'customAction'", msg.Action)
 		}
@@ -266,8 +311,8 @@ func TestCustomActionForwarding(t *testing.T) {
 		if msg.Params["foo"] == nil || msg.Params["foo"][0] != "bar" {
 			t.Errorf("params = %v, want foo=bar", msg.Params)
 		}
-		respCh <- YomitanResponse{ResponseStatusCode: 200, Data: "ok"}
-	}()
+		return echo(msg, 200, "ok")
+	})
 
 	req := httptest.NewRequest("POST", "/customAction?foo=bar", strings.NewReader(`{"key":"value"}`))
 	w := httptest.NewRecorder()
@@ -276,40 +321,23 @@ func TestCustomActionForwarding(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("custom action: status = %d, want 200", w.Code)
 	}
+	if got := strings.TrimSpace(w.Body.String()); got != `"ok"` {
+		t.Errorf("body = %s, want \"ok\"", got)
+	}
 }
 
-func TestMessageChannelTimeout(t *testing.T) {
-	// messageChan with zero buffer and nobody reading — should timeout
-	msgCh := make(chan NativeMessage) // unbuffered, no reader
-	respCh := make(chan YomitanResponse, 1)
-	h := &requestHandler{messageChan: msgCh, responseChan: respCh}
-
-	req := httptest.NewRequest("POST", "/slowAction", strings.NewReader("{}"))
-	w := httptest.NewRecorder()
-
-	done := make(chan struct{})
-	go func() {
-		h.ServeHTTP(w, req)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		if w.Code != http.StatusServiceUnavailable {
-			t.Errorf("timeout: status = %d, want %d", w.Code, http.StatusServiceUnavailable)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("handler did not timeout")
+func TestResponseTimeout(t *testing.T) {
+	h := newTestHandler(t, noAnswer)
+	_, err := h.bridge.roundTrip(NativeMessage{Action: "slowAction", Body: "{}"}, 50*time.Millisecond)
+	if err != errTimeout {
+		t.Fatalf("err = %v, want errTimeout", err)
 	}
 }
 
 func TestResponseForwardsStatusCode(t *testing.T) {
-	h, msgCh, respCh := newTestHandler()
-
-	go func() {
-		<-msgCh
-		respCh <- YomitanResponse{ResponseStatusCode: 404, Data: "not found"}
-	}()
+	h := newTestHandler(t, func(msg NativeMessage) *YomitanResponse {
+		return echo(msg, 404, "not found")
+	})
 
 	req := httptest.NewRequest("POST", "/something", strings.NewReader(""))
 	w := httptest.NewRecorder()
@@ -317,6 +345,109 @@ func TestResponseForwardsStatusCode(t *testing.T) {
 
 	if w.Code != 404 {
 		t.Errorf("forwarded status = %d, want 404", w.Code)
+	}
+}
+
+// A slow request must not hold up a fast one once Yomitan has shown it echoes request ids.
+func TestSlowRequestDoesNotBlockFastOne(t *testing.T) {
+	release := make(chan struct{})
+	h := newTestHandler(t, func(msg NativeMessage) *YomitanResponse {
+		if msg.Action == "slow" {
+			<-release
+		}
+		return echo(msg, 200, msg.Action)
+	})
+	post := func(action string) string {
+		req := httptest.NewRequest("POST", "/"+action, strings.NewReader("{}"))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return strings.TrimSpace(w.Body.String())
+	}
+
+	// The first reply confirms echoing.
+	if got := post("warmup"); got != `"warmup"` {
+		t.Fatalf("warmup = %s", got)
+	}
+
+	slow := make(chan string, 1)
+	go func() { slow <- post("slow") }()
+	time.Sleep(20 * time.Millisecond)
+
+	fast := make(chan string, 1)
+	go func() { fast <- post("fast") }()
+	select {
+	case got := <-fast:
+		if got != `"fast"` {
+			t.Errorf("fast = %s, want \"fast\"", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fast request waited behind the slow one")
+	}
+
+	close(release)
+	if got := <-slow; got != `"slow"` {
+		t.Errorf("slow = %s, want \"slow\"", got)
+	}
+}
+
+// Many concurrent requests each get their own reply, whatever order Yomitan answers in.
+func TestConcurrentRepliesRoutedById(t *testing.T) {
+	h := newTestHandler(t, func(msg NativeMessage) *YomitanResponse {
+		time.Sleep(time.Duration(len(msg.Body)%7) * time.Millisecond)
+		return echo(msg, 200, msg.Body)
+	})
+	h.bridge.roundTrip(NativeMessage{Action: "warmup", Body: "{}"}, time.Second)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := strings.Repeat("x", i)
+			got, err := h.bridge.roundTrip(NativeMessage{Action: "a", Body: body}, 2*time.Second)
+			if err != nil {
+				t.Errorf("request %d: %v", i, err)
+				return
+			}
+			if got.Data != body {
+				t.Errorf("request %d got the reply for %q", i, got.Data)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// Without echoed ids, replies are matched in order, so only one request may be in flight.
+func TestWithoutEchoRequestsAreSerial(t *testing.T) {
+	var inFlight, maxInFlight atomic.Int32
+	h := newTestHandler(t, func(msg NativeMessage) *YomitanResponse {
+		n := inFlight.Add(1)
+		for {
+			m := maxInFlight.Load()
+			if n <= m || maxInFlight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		inFlight.Add(-1)
+		return &YomitanResponse{ResponseStatusCode: 200, Data: msg.Body}
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := strconv.Itoa(i)
+			got, err := h.bridge.roundTrip(NativeMessage{Action: "a", Body: body}, 2*time.Second)
+			if err != nil || got.Data != body {
+				t.Errorf("request %d: got %v, %v", i, got.Data, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if maxInFlight.Load() != 1 {
+		t.Errorf("max in flight = %d, want 1", maxInFlight.Load())
 	}
 }
 
