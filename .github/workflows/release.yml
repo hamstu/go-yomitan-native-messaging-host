@@ -45,6 +45,8 @@ jobs:
           echo "Next version: v${NEXT}"
 
       - name: Build all platforms
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p dist
 
@@ -53,6 +55,7 @@ jobs:
             "darwin/arm64"
             "windows/amd64"
             "windows/386"
+            "windows/arm64"
             "linux/amd64"
             "linux/386"
             "linux/arm"
@@ -67,9 +70,12 @@ jobs:
               output="${output}.exe"
             fi
             echo "Building ${output}..."
-            GOOS=$GOOS GOARCH=$GOARCH go build -o "dist/${output}"
+            GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X main.hostVersion=${TAG}" -o "dist/${output}"
           done
 
+          (cd dist && sha256sum yomitan-host-* > SHA256SUMS)
+          cat dist/SHA256SUMS
           ls -lh dist/
 
       - name: Create release

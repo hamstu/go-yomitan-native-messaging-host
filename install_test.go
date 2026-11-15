@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -343,5 +344,52 @@ func TestCopyFileSourceMissing(t *testing.T) {
 	err := copyFile("/nonexistent/path", filepath.Join(t.TempDir(), "dst"))
 	if err == nil {
 		t.Fatal("expected error for missing source")
+	}
+}
+
+// Updating replaces the binary by rename, so a process holding the old file keeps reading the
+// old content and no temp files are left behind.
+func TestCopyFileReplacesAtomically(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("rename over an open file is not supported on Windows")
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "yomitan-host")
+	if err := os.WriteFile(dst, []byte("old binary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	running, err := os.Open(dst) // stands in for the browser's running host
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer running.Close()
+
+	src := filepath.Join(t.TempDir(), "new")
+	if err := os.WriteFile(src, []byte("new binary"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile: %v", err)
+	}
+
+	got, _ := os.ReadFile(dst)
+	if string(got) != "new binary" {
+		t.Errorf("dst = %q, want new binary", got)
+	}
+	info, _ := os.Stat(dst)
+	if info.Mode()&0111 == 0 {
+		t.Error("dst is not executable")
+	}
+	old, _ := io.ReadAll(running)
+	if string(old) != "old binary" {
+		t.Errorf("open handle reads %q, want old binary", old)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("dir has %v, want only yomitan-host", names)
 	}
 }

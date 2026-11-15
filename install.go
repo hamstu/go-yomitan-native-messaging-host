@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -244,15 +245,49 @@ func installToDir(browser, installDir, exePath string) error {
 	return nil
 }
 
+// copyFile copies src to dst as an executable, atomically: it writes a temp file in dst's folder
+// and renames it over dst. A browser may be running the old binary; on macOS/Linux the rename
+// leaves that process's open file intact, and dst is never seen half-written.
 func copyFile(src, dst string) error {
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	data, err := os.ReadFile(src)
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, data, 0755)
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			tmp.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0755); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }

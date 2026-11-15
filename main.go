@@ -26,6 +26,28 @@ const (
 	YOMITAN_API_NATIVE_MESSAGING_VERSION = 1
 )
 
+// hostVersion is the release tag this binary was built as, set at build time with
+// -ldflags "-X main.hostVersion=v3". Local builds report "dev".
+var hostVersion = "dev"
+
+// serverVersionResponse answers /serverVersion. Yomitan compares Version; the other fields let a
+// caller (Kimochi) tell which helper build it is talking to.
+type serverVersionResponse struct {
+	Version     int    `json:"version"`
+	Host        string `json:"host"`
+	HostVersion string `json:"hostVersion"`
+	Concurrent  bool   `json:"concurrent"`
+}
+
+func currentServerVersion() serverVersionResponse {
+	return serverVersionResponse{
+		Version:     YOMITAN_API_NATIVE_MESSAGING_VERSION,
+		Host:        "kimochi",
+		HostVersion: hostVersion,
+		Concurrent:  true,
+	}
+}
+
 var (
 	blacklistedPaths = []string{"favicon.ico"}
 	scriptPath       string
@@ -340,7 +362,7 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "serverVersion" || path == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]int{"version": YOMITAN_API_NATIVE_MESSAGING_VERSION})
+		json.NewEncoder(w).Encode(currentServerVersion())
 		return
 	}
 
@@ -385,6 +407,12 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// "version" prints the build's version and touches nothing else.
+	if len(os.Args) >= 2 && os.Args[1] == "version" {
+		fmt.Println(hostVersion)
+		return
+	}
+
 	// Handle "install" subcommand
 	if len(os.Args) >= 2 && os.Args[1] == "install" {
 		runInstall(os.Args[2:])

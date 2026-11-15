@@ -8,6 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -234,13 +238,52 @@ func TestServerVersionEndpoint(t *testing.T) {
 			continue
 		}
 
-		var body map[string]int
-		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-			t.Errorf("POST %s: invalid JSON: %v", path, err)
-			continue
+		want := `{"version":1,"host":"kimochi","hostVersion":"dev","concurrent":true}`
+		if got := strings.TrimSpace(w.Body.String()); got != want {
+			t.Errorf("POST %s: body = %s, want %s", path, got, want)
 		}
-		if body["version"] != YOMITAN_API_NATIVE_MESSAGING_VERSION {
-			t.Errorf("POST %s: version = %d, want %d", path, body["version"], YOMITAN_API_NATIVE_MESSAGING_VERSION)
+	}
+}
+
+func TestServerVersionReportsBuildVersion(t *testing.T) {
+	old := hostVersion
+	hostVersion = "v3"
+	t.Cleanup(func() { hostVersion = old })
+
+	h := newTestHandler(t, noAnswer)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/serverVersion", nil))
+	want := `{"version":1,"host":"kimochi","hostVersion":"v3","concurrent":true}`
+	if got := strings.TrimSpace(w.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+}
+
+// The version subcommand must print only the version and start nothing: no crowbar file, no server.
+func TestVersionSubcommand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "yomitan-host")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	build := exec.Command("go", "build", "-ldflags", "-X main.hostVersion=v99", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, "version").Output()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if string(out) != "v99\n" {
+		t.Errorf("output = %q, want %q", out, "v99\n")
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != filepath.Base(bin) {
+			t.Errorf("version created %s", e.Name())
 		}
 	}
 }

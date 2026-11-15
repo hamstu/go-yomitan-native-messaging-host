@@ -16,6 +16,8 @@ echo "Building for Windows (64-bit)..."
 GOOS=windows GOARCH=amd64 go build -o builds/yomitan-host-windows-amd64.exe
 echo "Building for Windows (32-bit)..."
 GOOS=windows GOARCH=386 go build -o builds/yomitan-host-windows-386.exe
+echo "Building for Windows (ARM64)..."
+GOOS=windows GOARCH=arm64 go build -o builds/yomitan-host-windows-arm64.exe
 
 # Linux
 echo "Building for Linux (64-bit)..."
